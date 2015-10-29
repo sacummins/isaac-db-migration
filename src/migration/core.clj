@@ -23,9 +23,7 @@
 
 (def pg-db {:classname   "org.postgresql.Driver"
             :subprotocol "postgresql"
-            :subname     "//localhost/rutherford"
-            :user        "postgres"
-            :password    "omoikane"})
+            :subname     "//localhost/rutherford"})
 
 (defmacro with-mongo-conn [[c e] & body]
   `(let [~c ~e]
@@ -58,44 +56,67 @@
                         {k v})) m)))
 
 
-(def args-with-values ["mongo-user"])
+(def args-with-values ["pg-user", "pg-passwd"])
 
 (defn -main [& args]
-  (with-mongo-conn [conn (mg/connect)]
-    (let [db (mg/get-db conn "rutherford")
-          users (mc/find-maps db "users")
-          linked-accounts (mc/find-maps db "linkedAccounts")]
+  (let [args (let [next-val (atom nil)]
+               (reduce (fn [a x]
+                         (if-let [nv @next-val]
+                           (do
+                             (reset! next-val nil)
+                             (assoc a (keyword nv) x))
+                           (do
+                             (when (some #(= % x) args-with-values)
+                               (reset! next-val x))
+                             (assoc a (keyword x) nil))))
+                       {} args)
+               )]
 
-      (println "Loaded" (count users) "users")
-      (println "Loaded" (count linked-accounts) "linkedAccounts")
 
-      (let [migrated-users (map (comp migrate-dates
-                                      ensure-email
-                                      (partial migrate-fields user-field-mappings)
-                                      migrate-keys) users)]
+    (def pg-db (assoc pg-db :user (:pg-user args)
+                            :password (:pg-passwd args)))
 
-        (jdbc/execute! pg-db ["TRUNCATE users CASCADE"])
+    (with-mongo-conn [conn (mg/connect)]
+      (let [db (mg/get-db conn "rutherford")
+            users (mc/find-maps db "users")
+            linked-accounts (mc/find-maps db "linkedAccounts")]
 
-        (apply jdbc/insert! pg-db :users migrated-users)
+        (println "Loaded" (count users) "users")
+        (println "Loaded" (count linked-accounts) "linkedAccounts")
 
-        #_(doseq [u migrated-users]
-            (try
-              (jdbc/insert! pg-db :users u)
-              (catch PSQLException e
-                (println "Failed to add User" u (.getMessage e))
-                (flush))))
+        (let [migrated-users (map (comp migrate-dates
+                                        ensure-email
+                                        (partial migrate-fields user-field-mappings)
+                                        migrate-keys) users)]
 
-        (let [user-legacy-id-map (apply merge (map (fn [{mongo-id :_id pg-id :id}]
-                                                     {mongo-id pg-id})
-                                                   (jdbc/query pg-db ["SELECT _id, id FROM users"])))
-              migrated-linked-accounts (map (comp #(dissoc % :_id)
-                                                  #(assoc % :user_id (get user-legacy-id-map (:user_id %)))
-                                                  (partial migrate-fields linked-account-field-mappings)
-                                                  migrate-keys) linked-accounts)]
+          (if (contains? args :truncate)
+            (do
+              (println "TRUNCATING users and linked_accounts")
+              (jdbc/execute! pg-db ["TRUNCATE users CASCADE"])))
 
-          (apply jdbc/insert! pg-db :linked_accounts migrated-linked-accounts)
+          (println "Inserting all user data into postgres")
+          (apply jdbc/insert! pg-db :users migrated-users)
 
-          (println (first migrated-linked-accounts))
-          (println (:count (first (jdbc/query pg-db ["SELECT count(*) FROM users"]))) "total users")))))
+          #_(doseq [u migrated-users]
+              (try
+                (jdbc/insert! pg-db :users u)
+                (catch PSQLException e
+                  (println "Failed to add User" u (.getMessage e))
+                  (flush))))
+
+          (let [user-legacy-id-map (apply merge (map (fn [{mongo-id :_id pg-id :id}]
+                                                       {mongo-id pg-id})
+                                                     (jdbc/query pg-db ["SELECT _id, id FROM users"])))
+                migrated-linked-accounts (map (comp #(dissoc % :_id)
+                                                    #(assoc % :user_id (get user-legacy-id-map (:user_id %)))
+                                                    (partial migrate-fields linked-account-field-mappings)
+                                                    migrate-keys) linked-accounts)]
+
+            (println "Inserting all linked account data into postgres")
+            (apply jdbc/insert! pg-db :linked_accounts migrated-linked-accounts)
+            (println "Migrated: ")
+            (println (:count (first (jdbc/query pg-db ["SELECT count(*) FROM users"]))) "total users")
+            (println (:count (first (jdbc/query pg-db ["SELECT count(*) FROM linked_accounts"]))) "total linked accounts")
+            )))))
 
   (println "Migration Completed"))
