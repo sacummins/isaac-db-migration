@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="ReplState" timestamp="1446120372261">{:repl-history {:ide [], :local [&quot;(+ 3 4)&quot; &quot;(use 'migration.core)&quot; &quot;(foo \&quot;steve\&quot;)&quot; &quot;(in-ns 'migration.core)&quot; &quot;(mg/connect)&quot; &quot;edfgd&quot; &quot;(mc/find-maps db \&quot;users\&quot;)&quot; &quot;(mg/find-maps db \&quot;users\&quot;)&quot; &quot;u&quot; &quot;users&quot; &quot;(first users)&quot; &quot;(pprint (first users))&quot; &quot;(pprint (take 10 users))&quot; &quot;*ns*&quot; &quot;(-main)&quot;], :remote []}}</component>
+</project>
