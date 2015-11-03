@@ -10,4 +10,5 @@
                  [org.postgresql/postgresql "9.4-1201-jdbc4"]
                  [crypto-random "1.1.0"]]
   :main migration.core
+  :jvm-opts ["-Xmx5G"]
   :aot :all)
