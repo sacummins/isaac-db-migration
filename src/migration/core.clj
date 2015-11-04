@@ -135,7 +135,9 @@
 
                 migrated-logged-events (map (comp   migrate-dates
                                                     #(dissoc % :_id)
-                                                    #(assoc % :user_id (get user-legacy-id-map (:user_id %)))
+                                                    #(assoc % :user_id (if (get user-legacy-id-map (:user_id %))
+                                                                         (get user-legacy-id-map (:user_id %))
+                                                                         (:user_id %)))
                                                     (partial migrate-fields logged-event-field-mappings)
                                                     migrate-keys) logged-events)]
 
