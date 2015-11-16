@@ -11,31 +11,24 @@
            (java.sql Timestamp)
            (org.postgresql.util PSQLException PGobject)))
 
-(def user-field-mappings {:_id       (fn [old-id] (str old-id))
-                     :school_id #(Integer/parseInt %)
-                     :last_seen #(if (instance? Long %)
-                                  (Date. %)
-                                  %)})
-
-(def linked-account-field-mappings {:_id       (fn [old-id] (str old-id))
-                                    })
-
-(def logged-event-field-mappings {:event_details (fn [map] (doto (PGobject.)
+(def question-attempt-field-mappings {:question_attempt (fn [map] (doto (PGobject.)
                                                              (.setType "jsonb")
                                                              (.setValue (json/write-str map :value-fn (fn [k v]
                                                                                                         (if (instance? Date v)
                                                                                                           (.getTime v)
                                                                                                           v))))))
-                                  :ip_address    (fn [v] (doto (PGobject.)
-                                                           (.setType "inet")
-                                                           (.setValue (let [s (first (str/split (or v "") #","))]
-                                                                        (if (or (= s "") (= s "unknown"))
-                                                                          nil
-                                                                          s)))))
                                   })
 
+(defn mapp->pgobject [m] (doto (PGobject.)
+                          (.setType "jsonb")
+                          (.setValue (json/write-str m :value-fn (fn [_ v]
+                                                                     (if (instance? Date v)
+                                                                       (.getTime v)
+                                                                       v))))))
 
-(def field-name-mapping {:localUserId :user_id})
+
+(def field-name-mapping {:localUserId :user_id
+                         :question_attempts :question_attempt})
 
 (def pg-db {:classname   "org.postgresql.Driver"
             :subprotocol "postgresql"
@@ -62,9 +55,6 @@
                         (instance? Date v) {k (Timestamp. (.getTime v))}
                         (map? v) {k (migrate-dates v)}
                         :else {k v})) m)))
-
-(defn ensure-email [m]
-  (assoc m :email (or (:email m) (str (rand/hex 6) "@null"))))
 
 (defn migrate-fields [field-mappings m]
   (apply merge (map (fn [[k v]]
@@ -95,67 +85,68 @@
 
     (with-mongo-conn [conn (mg/connect)]
       (let [db (mg/get-db conn "rutherford")
-            users (mc/find-maps db "users")
-            linked-accounts (mc/find-maps db "linkedAccounts")
-            logged-events (mc/find-maps db "loggedEvents")]
+            ;users (mc/find-maps db "users")
+            ;linked-accounts (mc/find-maps db "linkedAccounts")
+            question-attempts (mc/find-maps db "questionAttempts")]
 
-        (println "Loaded" (count users) "users")
-        (println "Loaded" (count linked-accounts) "linkedAccounts")
-        ;(println "Loaded" (count logged-events) "loggedEvents")
+        #_(doseq [u migrated-users]
+            (try
+              (jdbc/insert! pg-db :users u)
+              (catch PSQLException e
+                (println "Failed to add User" u (.getMessage e))
+                (flush))))
 
-        (let [migrated-users (map (comp migrate-dates
-                                        ensure-email
-                                        (partial migrate-fields user-field-mappings)
-                                        migrate-keys) users)]
+        (let [user-legacy-id-map (apply merge (map (fn [{mongo-id :_id pg-id :id}]
+                                                     {mongo-id pg-id})
+                                                   (jdbc/query pg-db ["SELECT _id, id FROM users"])))
 
+
+              #_migrated-question-attempts #_(map (comp migrate-dates
+                                                #(dissoc % :_id)
+                                                #(assoc % :user_id (if (get user-legacy-id-map (:user_id %))
+                                                                     (get user-legacy-id-map (:user_id %))
+                                                                     (:user_id %)))
+                                                (partial migrate-fields question-attempt-field-mappings)
+                                                migrate-keys) question-attempts)
+
+              migrated-question-attempts (apply concat (map (fn [x]
+                                                              (let [user-id (:userId x)
+                                                                    question-page-attempts (:questionAttempts x)]
+                                                                (let [question-part-attempts (map second question-page-attempts)
+                                                                      question-part-attempts (apply merge question-part-attempts)]
+
+                                                                  (apply concat (map (fn [[question-id attempts]]
+                                                                                       (filter identity (map (fn [attempt]
+                                                                                                               (if-let [new-user-id (get user-legacy-id-map user-id)]
+                                                                                                                 {:user_id          new-user-id
+                                                                                                                  :question_id      (name question-id)
+                                                                                                                  :question_attempt (mapp->pgobject attempt)
+                                                                                                                  :correct          (:correct attempt)
+                                                                                                                  :timestamp        (Timestamp. (if (instance? Date (:dateAttempted attempt))
+                                                                                                                                                  (.getTime (:dateAttempted attempt))
+                                                                                                                                                  (:dateAttempted attempt)))
+                                                                                                                  }
+                                                                                                                 nil)) attempts))) question-part-attempts))))
+                                                              ) question-attempts) )]
+
+
+          (pprint (take 1 migrated-question-attempts))
+
+          (println "Inserting all question data into postgres")
+          ;(apply jdbc/insert! pg-db :users question-attempts)
           (if (contains? args :truncate)
             (do
-              (println "TRUNCATING users, logged_events and linked_accounts")
-              (jdbc/execute! pg-db ["TRUNCATE users CASCADE"])
-              (jdbc/execute! pg-db ["TRUNCATE logged_events"])))
+              (println "TRUNCATING question_attempts")
+              (jdbc/execute! pg-db ["TRUNCATE question_attempts CASCADE"])))
 
-          (println "Inserting all user data into postgres")
-          (apply jdbc/insert! pg-db :users migrated-users)
 
-          #_(doseq [u migrated-users]
-              (try
-                (jdbc/insert! pg-db :users u)
-                (catch PSQLException e
-                  (println "Failed to add User" u (.getMessage e))
-                  (flush))))
+          (doseq [es (partition-all 10000 migrated-question-attempts)]
+            (apply jdbc/insert! pg-db :question_attempts es)
+            (println "question attempt chunk inserted")
+            (flush))
 
-          (let [user-legacy-id-map (apply merge (map (fn [{mongo-id :_id pg-id :id}]
-                                                       {mongo-id pg-id})
-                                                     (jdbc/query pg-db ["SELECT _id, id FROM users"])))
-
-                migrated-linked-accounts (map (comp #(dissoc % :_id)
-                                                    #(assoc % :user_id (get user-legacy-id-map (:user_id %)))
-                                                    (partial migrate-fields linked-account-field-mappings)
-                                                    migrate-keys) linked-accounts)
-
-                migrated-logged-events (map (comp   migrate-dates
-                                                    #(dissoc % :_id)
-                                                    #(assoc % :user_id (if (get user-legacy-id-map (:user_id %))
-                                                                         (get user-legacy-id-map (:user_id %))
-                                                                         (:user_id %)))
-                                                    (partial migrate-fields logged-event-field-mappings)
-                                                    migrate-keys) logged-events)]
-
-            (println "Inserting all linked account data into postgres")
-            (apply jdbc/insert! pg-db :linked_accounts migrated-linked-accounts)
-
-            (println "Inserting all log events data into postgres")
-            #_(apply jdbc/insert! pg-db :logged_events migrated-logged-events)
-
-            (doseq [es (partition-all 100000 migrated-logged-events)]
-              (apply jdbc/insert! pg-db :logged_events es)
-              (println "chunk inserted")
-              (flush))
-
-            (println "Migrated: ")
-            (println (:count (first (jdbc/query pg-db ["SELECT count(*) FROM users"]))) "total users")
-            (println (:count (first (jdbc/query pg-db ["SELECT count(*) FROM linked_accounts"]))) "total linked accounts")
-            (println (:count (first (jdbc/query pg-db ["SELECT count(*) FROM logged_events"]))) "total logged events")
-            )))))
+          (println "Migrated: ")
+          (println (:count (first (jdbc/query pg-db ["SELECT count(*) FROM question_attempts"]))) "total questionAttempts")
+          ))))
 
   (println "Migration Completed"))
