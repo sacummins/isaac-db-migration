@@ -87,7 +87,8 @@
       (let [db (mg/get-db conn "rutherford")
             ;users (mc/find-maps db "users")
             ;linked-accounts (mc/find-maps db "linkedAccounts")
-            question-attempts (mc/find-maps db "questionAttempts")]
+            question-attempts (mc/find-maps db "questionAttempts")
+            invalid-users (atom #{})]
 
         #_(doseq [u migrated-users]
             (try
@@ -126,11 +127,14 @@
                                                                                                                                                   (.getTime (:dateAttempted attempt))
                                                                                                                                                   (:dateAttempted attempt)))
                                                                                                                   }
-                                                                                                                 nil)) attempts))) question-part-attempts))))
+                                                                                                                 (do
+                                                                                                                   (swap! invalid-users conj user-id)
+                                                                                                                   (println (count @invalid-users) "Ignored users")
+                                                                                                                   nil))) attempts))) question-part-attempts))))
                                                               ) question-attempts) )]
 
 
-          (pprint (take 1 migrated-question-attempts))
+          ;(pprint (take 1 migrated-question-attempts))
 
           (println "Inserting all question data into postgres")
           ;(apply jdbc/insert! pg-db :users question-attempts)
@@ -147,6 +151,7 @@
 
           (println "Migrated: ")
           (println (:count (first (jdbc/query pg-db ["SELECT count(*) FROM question_attempts"]))) "total questionAttempts")
+          (println @invalid-users "Could not be resolved so there question attempts were not imported.")
           ))))
 
   (println "Migration Completed"))
