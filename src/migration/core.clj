@@ -85,22 +85,21 @@
 
     (with-mongo-conn [conn (mg/connect)]
       (let [db (mg/get-db conn "rutherford")
-            ;users (mc/find-maps db "users")
-            ;linked-accounts (mc/find-maps db "linkedAccounts")
-            question-attempts (mc/find-maps db "questionAttempts")
-            invalid-users (atom #{})]
-
-        #_(doseq [u migrated-users]
-            (try
-              (jdbc/insert! pg-db :users u)
-              (catch PSQLException e
-                (println "Failed to add User" u (.getMessage e))
-                (flush))))
+            groups (mc/find-maps db "userGroups")
+            group-memberships (mc/find-maps db "groupMemberships")
+            assignments (mc/find-maps db "assignments")
+            user-associations (mc/find-maps db "userAssociations")
+            user-association-tokens (mc/find-maps db "userAssociationsTokens")]
 
         (let [user-legacy-id-map (apply merge (map (fn [{mongo-id :_id pg-id :id}]
                                                      {mongo-id pg-id})
                                                    (jdbc/query pg-db ["SELECT _id, id FROM users"])))
 
+              migrated-groups (map (comp migrate-dates
+                                         #(assoc % :owner_id (if-let [new-id (get user-legacy-id-map (:owner_id %))]
+                                                                new-id
+                                                                (:owner_id %)))
+                                         migrate-keys) groups)
 
               #_migrated-question-attempts #_(map (comp migrate-dates
                                                 #(dissoc % :_id)
@@ -108,50 +107,119 @@
                                                                      (get user-legacy-id-map (:user_id %))
                                                                      (:user_id %)))
                                                 (partial migrate-fields question-attempt-field-mappings)
-                                                migrate-keys) question-attempts)
-
-              migrated-question-attempts (apply concat (map (fn [x]
-                                                              (let [user-id (:userId x)
-                                                                    question-page-attempts (:questionAttempts x)]
-                                                                (let [question-part-attempts (map second question-page-attempts)
-                                                                      question-part-attempts (apply merge question-part-attempts)]
-
-                                                                  (apply concat (map (fn [[question-id attempts]]
-                                                                                       (filter identity (map (fn [attempt]
-                                                                                                               (if-let [new-user-id (get user-legacy-id-map user-id)]
-                                                                                                                 {:user_id          new-user-id
-                                                                                                                  :question_id      (name question-id)
-                                                                                                                  :question_attempt (mapp->pgobject attempt)
-                                                                                                                  :correct          (:correct attempt)
-                                                                                                                  :timestamp        (Timestamp. (if (instance? Date (:dateAttempted attempt))
-                                                                                                                                                  (.getTime (:dateAttempted attempt))
-                                                                                                                                                  (:dateAttempted attempt)))
-                                                                                                                  }
-                                                                                                                 (do
-                                                                                                                   (swap! invalid-users conj user-id)
-                                                                                                                   (println (count @invalid-users) "Ignored users")
-                                                                                                                   nil))) attempts))) question-part-attempts))))
-                                                              ) question-attempts) )]
+                                                migrate-keys) question-attempts)]
 
 
-          ;(pprint (take 1 migrated-question-attempts))
+          (pprint (take 1 migrated-groups))
 
-          (println "Inserting all question data into postgres")
+          (println "Inserting all group data into postgres")
           ;(apply jdbc/insert! pg-db :users question-attempts)
           (if (contains? args :truncate)
             (do
-              (println "TRUNCATING question_attempts")
-              (jdbc/execute! pg-db ["TRUNCATE question_attempts CASCADE"])))
+              (println "TRUNCATING groups, group_memberships, assignments, user_associations and user_associations_tokens")
+              (jdbc/execute! pg-db ["TRUNCATE groups RESTART IDENTITY CASCADE"])
+              (jdbc/execute! pg-db ["TRUNCATE group_memberships RESTART IDENTITY CASCADE"])
+              (jdbc/execute! pg-db ["TRUNCATE assignments RESTART IDENTITY CASCADE"])
+              (jdbc/execute! pg-db ["TRUNCATE user_associations RESTART IDENTITY CASCADE"])
+              (jdbc/execute! pg-db ["TRUNCATE user_associations_tokens RESTART IDENTITY CASCADE"])))
+
+          (let [group-legacy-id-map (apply merge (for [g migrated-groups]
+                                                   (try (let [new-group-id (:id (first (jdbc/insert! pg-db :groups (dissoc g :_id))))]
+                                                          {(str (:_id g)) new-group-id})
+                                                        (catch Exception e
+                                                          (println "failed to add group" g (.getMessage e))))
+
+                                                   ))
+
+                migrated-group-memberships (map (comp migrate-dates
+                                                      #(dissoc % :_id)
+
+                                                      #(assoc % :user_id (if-let [new-id (get user-legacy-id-map (:user_id %))]
+                                                                           new-id
+                                                                           (:user_id %))
+                                                                :group_id (if-let [new-id (get group-legacy-id-map (:group_id %))]
+                                                                            new-id
+                                                                            (:group_id %)))
+                                                      migrate-keys) group-memberships)
+                migrated-assignments (map (comp migrate-dates
+                                                #(dissoc % :_id)
+
+                                                #(assoc % :owner_user_id (if-let [new-id (get user-legacy-id-map (:owner_user_id %))]
+                                                                     new-id
+                                                                     (:owner_user_id %))
+                                                          :group_id (if-let [new-id (get group-legacy-id-map (:group_id %))]
+                                                                      new-id
+                                                                      (:group_id %)))
+                                                migrate-keys) assignments)
+
+                migrated-associations (map (comp migrate-dates
+                                                 #(dissoc % :_id)
+
+                                                 #(assoc % :user_id_granting_permission (if-let [new-id (get user-legacy-id-map (:user_id_granting_permission %))]
+                                                                            new-id
+                                                                            (:user_id_granting_permission %))
+                                                           :user_id_receiving_permission (if-let [new-id (get user-legacy-id-map (:user_id_receiving_permission %))]
+                                                                                          new-id
+                                                                                          (:user_id_receiving_permission %)))
+                                                 migrate-keys) user-associations)
+
+                migrated-association-tokens (map (comp migrate-dates
+                                                       #(dissoc % :_id)
+
+                                                       #(assoc % :owner_user_id (if-let [new-id (get user-legacy-id-map (:owner_user_id %))]
+                                                                                                new-id
+                                                                                                (:owner_user_id %))
+                                                                 :group_id (if-let [new-id (get group-legacy-id-map (:group_id %))]
+                                                                             new-id
+                                                                             (:group_id %)))
+                                                       migrate-keys) user-association-tokens)]
+
+            (println "Inserting group membership information")
+
+            (doseq [m migrated-group-memberships]
+              (try
+                (jdbc/insert! pg-db :group_memberships m)
+                (catch Exception e
+                  (println "Could not insert group membership" m (.getMessage e)))))
+
+            (println "Inserting assignment information")
+
+            (doseq [a migrated-assignments]
+              (try
+                (jdbc/insert! pg-db :assignments a)
+                (catch Exception e
+                  (println "Could not insert assignment" a (.getMessage e)))))
 
 
-          (doseq [es (partition-all 10000 migrated-question-attempts)]
-            (apply jdbc/insert! pg-db :question_attempts es)
-            (println "question attempt chunk inserted")
-            (flush))
+            (println "Inserting user association information")
+
+            (doseq [a migrated-associations]
+              (try
+                (jdbc/insert! pg-db :user_associations a)
+                (catch Exception e
+                  (println "Could not insert association" a (.getMessage e)))))
+
+            (println "Inserting user association tokens information")
+
+            (doseq [a migrated-association-tokens]
+              (try
+                (jdbc/insert! pg-db :user_associations_tokens a)
+                (catch Exception e
+                  (println "Could not insert association token" a (.getMessage e)))))
+
+
+            #_(doseq [es (partition-all 10000 migrated-group-memberships)]
+              (apply jdbc/insert! pg-db :group_memberships es)
+              (println "group membership chunk inserted")
+              (flush)))
 
           (println "Migrated: ")
-          (println (:count (first (jdbc/query pg-db ["SELECT count(*) FROM question_attempts"]))) "total questionAttempts")
-          (println @invalid-users "Could not be resolved so there question attempts were not imported.")
+          (println (:count (first (jdbc/query pg-db ["SELECT count(*) FROM groups"]))) "total groups")
+          (println (:count (first (jdbc/query pg-db ["SELECT count(*) FROM group_memberships"]))) "total groups_memberships")
+          (println (:count (first (jdbc/query pg-db ["SELECT count(*) FROM assignments"]))) "total assignments")
+          (println (:count (first (jdbc/query pg-db ["SELECT count(*) FROM user_associations"]))) "total user_associations")
+          (println (:count (first (jdbc/query pg-db ["SELECT count(*) FROM user_associations_tokens"]))) "total user_associations_tokens")
+          ;(println @invalid-users "Could not be resolved so there question attempts were not imported.")
           ))))
 
   (println "Migration Completed"))
