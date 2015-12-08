@@ -17,25 +17,42 @@
                                   (Date. %)
                                   %)})
 
-(def linked-account-field-mappings {:_id       (fn [old-id] (str old-id))
-                                    })
-
-(def logged-event-field-mappings {:event_details (fn [map] (doto (PGobject.)
+(def gameboard-field-mappings {:_id       (fn [old-id] (str old-id))
+                               :wildcard (fn [map] (doto (PGobject.)
                                                              (.setType "jsonb")
                                                              (.setValue (json/write-str map :value-fn (fn [k v]
                                                                                                         (if (instance? Date v)
                                                                                                           (.getTime v)
                                                                                                           v))))))
-                                  :ip_address    (fn [v] (doto (PGobject.)
-                                                           (.setType "inet")
-                                                           (.setValue (let [s (first (str/split (or v "") #","))]
-                                                                        (if (or (= s "") (= s "unknown"))
-                                                                          nil
-                                                                          s)))))
+                               :game_filter (fn [map] (doto (PGobject.)
+                                                          (.setType "jsonb")
+                                                          (.setValue (json/write-str map :value-fn (fn [k v]
+                                                                                                     (if (instance? Date v)
+                                                                                                       (.getTime v)
+                                                                                                       v))))))
                                   })
 
+; this is voodoo as far as I am concerned
+(extend-protocol clojure.java.jdbc/ISQLParameter
+  clojure.lang.IPersistentVector
+  (set-parameter [v ^java.sql.PreparedStatement stmt ^long i]
+    (let [conn (.getConnection stmt)
+          meta (.getParameterMetaData stmt)
+          type-name (.getParameterTypeName meta i)]
+      (if-let [elem-type (when (= (first type-name) \_) (apply str (rest type-name)))]
+        (.setObject stmt i (.createArrayOf conn elem-type (to-array v)))
+        (.setObject stmt i v)))))
 
-(def field-name-mapping {:localUserId :user_id})
+(extend-protocol clojure.java.jdbc/IResultSetReadColumn
+  java.sql.Array
+  (result-set-read-column [val _ _]
+    (into [] (.getArray val))))
+; end of voodoo
+
+
+(def field-name-mapping {:wildCard :wildcard
+                         :wildCardPosition :wildcard_position
+                         :_id :id})
 
 (def pg-db {:classname   "org.postgresql.Driver"
             :subprotocol "postgresql"
@@ -62,9 +79,6 @@
                         (instance? Date v) {k (Timestamp. (.getTime v))}
                         (map? v) {k (migrate-dates v)}
                         :else {k v})) m)))
-
-(defn ensure-email [m]
-  (assoc m :email (or (:email m) (str (rand/hex 6) "@null"))))
 
 (defn migrate-fields [field-mappings m]
   (apply merge (map (fn [[k v]]
@@ -95,67 +109,53 @@
 
     (with-mongo-conn [conn (mg/connect)]
       (let [db (mg/get-db conn "rutherford")
-            users (mc/find-maps db "users")
-            linked-accounts (mc/find-maps db "linkedAccounts")
-            logged-events (mc/find-maps db "loggedEvents")]
+            users-to-gameboards (mc/find-maps db "UsersToGameboards")
+            gameboards (mc/find-maps db "gameboards")]
 
-        (println "Loaded" (count users) "users")
-        (println "Loaded" (count linked-accounts) "linkedAccounts")
-        ;(println "Loaded" (count logged-events) "loggedEvents")
+        (if (contains? args :truncate)
+          (do
+            (println "TRUNCATING gameboards and users-to-gameboards")
+            (jdbc/execute! pg-db ["TRUNCATE gameboards RESTART IDENTITY CASCADE "])
+            (jdbc/execute! pg-db ["TRUNCATE user_gameboards RESTART IDENTITY CASCADE"])))
 
-        (let [migrated-users (map (comp migrate-dates
-                                        ensure-email
-                                        (partial migrate-fields user-field-mappings)
-                                        migrate-keys) users)]
 
-          (if (contains? args :truncate)
-            (do
-              (println "TRUNCATING users, logged_events and linked_accounts")
-              (jdbc/execute! pg-db ["TRUNCATE users CASCADE"])
-              (jdbc/execute! pg-db ["TRUNCATE logged_events"])))
+        (let [user-legacy-id-map (apply merge (map (fn [{mongo-id :_id pg-id :id}]
+                                                     {mongo-id pg-id})
+                                                   (jdbc/query pg-db ["SELECT _id, id FROM users"])))
 
-          (println "Inserting all user data into postgres")
-          (apply jdbc/insert! pg-db :users migrated-users)
+              migrated-gameboards (map (comp migrate-dates
+                                             #(assoc % :owner_user_id (if (get user-legacy-id-map (:owner_user_id %))
+                                                                  (get user-legacy-id-map (:owner_user_id %))
+                                                                  nil))
+                                             (partial migrate-fields gameboard-field-mappings)
+                                             migrate-keys) gameboards)
 
-          #_(doseq [u migrated-users]
-              (try
-                (jdbc/insert! pg-db :users u)
-                (catch PSQLException e
-                  (println "Failed to add User" u (.getMessage e))
-                  (flush))))
+              migrated-user-gameboards (map (comp migrate-dates
+                                                  #(dissoc % :id)
+                                                  #(assoc % :user_id (get user-legacy-id-map (:user_id %)))
+                                                  (partial migrate-fields gameboard-field-mappings)
+                                                  migrate-keys) users-to-gameboards)]
 
-          (let [user-legacy-id-map (apply merge (map (fn [{mongo-id :_id pg-id :id}]
-                                                       {mongo-id pg-id})
-                                                     (jdbc/query pg-db ["SELECT _id, id FROM users"])))
+          (println "Inserting all gameboards data into postgres")
+          (pprint (take 1 migrated-gameboards))
 
-                migrated-linked-accounts (map (comp #(dissoc % :_id)
-                                                    #(assoc % :user_id (get user-legacy-id-map (:user_id %)))
-                                                    (partial migrate-fields linked-account-field-mappings)
-                                                    migrate-keys) linked-accounts)
-
-                migrated-logged-events (map (comp   migrate-dates
-                                                    #(dissoc % :_id)
-                                                    #(assoc % :user_id (if (get user-legacy-id-map (:user_id %))
-                                                                         (get user-legacy-id-map (:user_id %))
-                                                                         (:user_id %)))
-                                                    (partial migrate-fields logged-event-field-mappings)
-                                                    migrate-keys) logged-events)]
-
-            (println "Inserting all linked account data into postgres")
-            (apply jdbc/insert! pg-db :linked_accounts migrated-linked-accounts)
-
-            (println "Inserting all log events data into postgres")
-            #_(apply jdbc/insert! pg-db :logged_events migrated-logged-events)
-
-            (doseq [es (partition-all 100000 migrated-logged-events)]
-              (apply jdbc/insert! pg-db :logged_events es)
+          (doseq [es (partition-all 1000 migrated-gameboards)]
+              (apply jdbc/insert! pg-db :gameboards es)
               (println "chunk inserted")
               (flush))
 
-            (println "Migrated: ")
-            (println (:count (first (jdbc/query pg-db ["SELECT count(*) FROM users"]))) "total users")
-            (println (:count (first (jdbc/query pg-db ["SELECT count(*) FROM linked_accounts"]))) "total linked accounts")
-            (println (:count (first (jdbc/query pg-db ["SELECT count(*) FROM logged_events"]))) "total logged events")
-            )))))
+          (println "Inserting all user_gameboards data into postgres")
+          (pprint (take 1 migrated-user-gameboards))
+          (doseq [mugb migrated-user-gameboards]
+              (try
+                (jdbc/insert! pg-db :user_gameboards mugb)
+                (catch PSQLException e
+                  (println "Failed to add user link to Gameboard" mugb (.getMessage e))
+                  (flush))))
+
+          (println "Migrated: ")
+          (println (:count (first (jdbc/query pg-db ["SELECT count(*) FROM gameboards"]))) "total gameboards")
+          (println (:count (first (jdbc/query pg-db ["SELECT count(*) FROM user_gameboards"]))) "total user_gameboards")
+          ))))
 
   (println "Migration Completed"))
